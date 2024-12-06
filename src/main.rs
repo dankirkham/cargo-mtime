@@ -8,19 +8,24 @@
 //! iff the sha256 of the file matches the sha256 stored in the
 //! database.
 
+mod cache;
+mod config;
+
+use std::collections::BTreeMap;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use async_walkdir::DirEntry;
 use async_walkdir::Filtering;
 use async_walkdir::WalkDir;
 use color_eyre::eyre::Context;
 use color_eyre::eyre::Result;
+use envconfig::Envconfig;
 use filetime::FileTime;
 use futures::StreamExt;
 use speedy::Readable;
 use speedy::Writable;
-use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
@@ -28,29 +33,8 @@ use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 
-#[derive(Debug, Clone)]
-struct Config {
-    root_dir: String,
-    db_path: String,
-}
-
-impl Config {
-    fn from_env() -> Self {
-        let args = std::env::args().collect::<Vec<_>>();
-        let root_dir = args
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| std::env::var("CARGO_MTIME_ROOT").unwrap())
-            .to_string();
-        let db_path = args
-            .get(2)
-            .cloned()
-            .unwrap_or_else(|| std::env::var("CARGO_MTIME_DB_PATH").unwrap())
-            .to_string();
-
-        Self { root_dir, db_path }
-    }
-}
+use crate::cache::DatabaseQuery;
+use crate::config::Config;
 
 #[derive(Default, Debug)]
 struct Metrics {
@@ -66,8 +50,6 @@ struct Metrics {
 
     database_mtime_write: AtomicUsize,
 }
-
-type DatabaseQuery = (String, String, oneshot::Sender<Option<i64>>);
 
 pub type Database = BTreeMap<String, BTreeMap<String, i64>>;
 
@@ -146,7 +128,7 @@ async fn database_lookup_task(
     metrics: Arc<Metrics>,
     read_connection: DB,
 ) -> Result<()> {
-    while let Some((path, sha256, response)) = query_rx.recv().await {
+    while let Some(DatabaseQuery { path, sha256, response }) = query_rx.recv().await {
         let path: String = path;
         let sha256: String = sha256;
         let mtime = try_get_mtime(&read_connection, &path, &sha256, metrics.as_ref()).await;
@@ -166,7 +148,7 @@ async fn main() {
 
     let metrics = Arc::new(Metrics::default());
 
-    let config = Config::from_env();
+    let config = Config::init_from_env().unwrap();
     let connection = init_database(&config).unwrap();
     let connection2 = connection.clone();
     let read_connection = connection.clone();
@@ -297,9 +279,12 @@ async fn manage_mtime(
 
     let string_path = path.to_string_lossy().to_string();
     let (response_tx, response_rx) = oneshot::channel();
-    query_tx
-        .send((string_path.clone(), sha256.clone(), response_tx))
-        .unwrap();
+    let query = DatabaseQuery {
+        path: string_path.clone(),
+        sha256: sha256.clone(),
+        response: response_tx,
+    };
+    query_tx.send(query).unwrap();
 
     if let Some(mtime) = response_rx.await.unwrap() {
         if mtime != mtime_on_disk {
