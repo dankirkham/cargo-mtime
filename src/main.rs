@@ -10,133 +10,26 @@
 
 mod cache;
 mod config;
+mod metrics;
 
-use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_walkdir::DirEntry;
 use async_walkdir::Filtering;
 use async_walkdir::WalkDir;
-use color_eyre::eyre::Context;
-use color_eyre::eyre::Result;
 use envconfig::Envconfig;
 use filetime::FileTime;
 use futures::StreamExt;
-use speedy::Readable;
-use speedy::Writable;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
-use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tracing::info;
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
-use crate::cache::DatabaseQuery;
+use crate::cache::{Cache, DiskCache};
 use crate::config::Config;
-
-#[derive(Default, Debug)]
-struct Metrics {
-    files_processed: AtomicUsize,
-    files_was_directory: AtomicUsize,
-    files_mtime_restored: AtomicUsize,
-    files_mtime_skipped: AtomicUsize,
-    files_mtime_updated: AtomicUsize,
-
-    database_mtime_queries: AtomicUsize,
-    database_mtime_hits: AtomicUsize,
-    database_mtime_misses: AtomicUsize,
-
-    database_mtime_write: AtomicUsize,
-}
-
-pub type Database = BTreeMap<String, BTreeMap<String, i64>>;
-
-#[derive(speedy::Readable, speedy::Writable, Debug, Default)]
-struct AppState {
-    version: Option<u32>,
-    mtime: Database,
-}
-
-type DB = Arc<RwLock<AppState>>;
-
-fn init_database(config: &Config) -> Result<DB> {
-    // Create the database if it doesn't exist
-    let file = std::fs::read(&config.db_path).unwrap_or_default();
-    let mut conn = if file.is_empty() {
-        Ok(AppState::default())
-    } else {
-        AppState::read_from_buffer(&file).wrap_err("Failed to read database")
-    }?;
-
-    let version = conn.version;
-
-    match version {
-        None => {
-            conn.version = Some(1);
-        }
-        Some(version) => {
-            if version != 1 {
-                panic!("Unsupported database version: {:?}", version);
-            }
-        }
-    }
-
-    Ok(Arc::new(RwLock::new(conn)))
-}
-
-async fn try_get_mtime(conn: &DB, path: &str, sha256: &str, metrics: &Metrics) -> Option<i64> {
-    metrics
-        .database_mtime_queries
-        .fetch_add(1, Ordering::Relaxed);
-
-    let r = conn.read().await;
-
-    let res = r.mtime.get(path).and_then(|x| x.get(sha256));
-
-    if res.is_some() {
-        metrics.database_mtime_hits.fetch_add(1, Ordering::Relaxed);
-    } else {
-        metrics
-            .database_mtime_misses
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    res.copied()
-}
-
-async fn update_database(
-    connection: &DB,
-    batch: &mut Vec<(String, String, i64)>,
-    metrics: &Metrics,
-) {
-    let mut conn = connection.write().await;
-
-    for (path, sha256, mtime) in batch.drain(..) {
-        let mtime_map = conn.mtime.entry(path).or_insert_with(BTreeMap::new);
-        mtime_map.insert(sha256, mtime);
-    }
-
-    metrics
-        .database_mtime_write
-        .fetch_add(batch.len(), Ordering::Relaxed);
-}
-
-async fn database_lookup_task(
-    mut query_rx: UnboundedReceiver<DatabaseQuery>,
-    metrics: Arc<Metrics>,
-    read_connection: DB,
-) -> Result<()> {
-    while let Some(DatabaseQuery { path, sha256, response }) = query_rx.recv().await {
-        let path: String = path;
-        let sha256: String = sha256;
-        let mtime = try_get_mtime(&read_connection, &path, &sha256, metrics.as_ref()).await;
-        response.send(mtime).unwrap();
-    }
-
-    Ok(())
-}
+use crate::metrics::Metrics;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
@@ -146,24 +39,15 @@ async fn main() {
         std::process::exit(1);
     }));
 
+    tracing_subscriber::fmt()
+        .with_span_events(FmtSpan::CLOSE)
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
     let metrics = Arc::new(Metrics::default());
 
     let config = Config::init_from_env().unwrap();
-    let connection = init_database(&config).unwrap();
-    let connection2 = connection.clone();
-    let read_connection = connection.clone();
-    // We'll use a single worker to write to the database, taking requests from all the other workers.
-    let (tx, rx) = unbounded_channel();
-    let handle = tokio::spawn(gather_submit_db(rx, connection, metrics.clone()));
-
-    // We'll also use a single worker to read from the database, taking requests from all the other workers.
-
-    let (query_tx, query_rx) = unbounded_channel::<DatabaseQuery>();
-    let query_handle = tokio::spawn(database_lookup_task(
-        query_rx,
-        metrics.clone(),
-        read_connection,
-    ));
+    let cache = Arc::new(DiskCache::init(&config, metrics.clone()).unwrap());
 
     // We'll use a semaphore to limit the number of concurrent file operations, to avoid running out of file descriptors.
     let semaphore = Arc::new(Semaphore::new(768));
@@ -184,6 +68,7 @@ async fn main() {
         Filtering::Continue
     });
 
+    let mut join_set = JoinSet::new();
     loop {
         match entries.next().await {
             Some(Ok(entry)) => {
@@ -196,16 +81,13 @@ async fn main() {
                     continue;
                 }
 
-                let tx = tx.clone();
-                let query_tx = query_tx.clone();
                 let semaphore = semaphore.clone();
 
-                tokio::spawn(manage_mtime(
+                join_set.spawn(manage_mtime(
                     entry,
-                    query_tx,
                     semaphore,
-                    tx,
                     metrics.clone(),
+                    cache.clone(),
                 ));
             }
             Some(Err(e)) => {
@@ -216,43 +98,12 @@ async fn main() {
         }
     }
 
-    drop(tx);
-    drop(query_tx);
-    drop(semaphore);
+    while join_set.join_next().await.is_some() { }
 
-    handle.await.unwrap();
-    query_handle.await.unwrap().unwrap();
+    let cache = Arc::<DiskCache>::try_unwrap(cache).unwrap();
+    cache.finalize().await;
 
-    let conn = connection2.read().await;
-    let buffer = conn.write_to_vec().unwrap();
-
-    let path = std::path::PathBuf::from(&config.db_path);
-
-    let prefix = path.parent();
-    if let Some(prefix) = prefix {
-        std::fs::create_dir_all(prefix).unwrap();
-    }
-    std::fs::write(&config.db_path, buffer).unwrap();
-}
-
-async fn gather_submit_db(
-    mut rx: UnboundedReceiver<(String, String, i64)>,
-    connection: DB,
-    metrics: Arc<Metrics>,
-) {
-    let mut current_batch: Vec<(String, String, i64)> = vec![];
-
-    while let Some((path, sha256, mtime)) = rx.recv().await {
-        current_batch.push((path, sha256, mtime));
-
-        if current_batch.len() >= 100 {
-            update_database(&connection, &mut current_batch, metrics.as_ref()).await;
-        }
-    }
-
-    if !current_batch.is_empty() {
-        update_database(&connection, &mut current_batch, metrics.as_ref()).await
-    }
+    info!("{:?}", metrics);
 }
 
 /// Attempts to set the mtime of the file on disk such that:
@@ -262,10 +113,9 @@ async fn gather_submit_db(
 /// * If the sha256 is the same, we set the mtime of the file to the recorded previous time
 async fn manage_mtime(
     entry: DirEntry,
-    query_tx: UnboundedSender<DatabaseQuery>,
     permit: Arc<Semaphore>,
-    tx: UnboundedSender<(String, String, i64)>,
     metrics: Arc<Metrics>,
+    cache: Arc<impl Cache>,
 ) {
     let permit = permit.acquire().await.unwrap();
     let path = entry.path();
@@ -278,15 +128,8 @@ async fn manage_mtime(
         FileTime::from_system_time(metadata.unwrap().modified().unwrap()).unix_seconds();
 
     let string_path = path.to_string_lossy().to_string();
-    let (response_tx, response_rx) = oneshot::channel();
-    let query = DatabaseQuery {
-        path: string_path.clone(),
-        sha256: sha256.clone(),
-        response: response_tx,
-    };
-    query_tx.send(query).unwrap();
 
-    if let Some(mtime) = response_rx.await.unwrap() {
+    if let Some(mtime) = cache.get(string_path.clone(), sha256.clone()).await {
         if mtime != mtime_on_disk {
             metrics.files_mtime_restored.fetch_add(1, Ordering::Relaxed);
             filetime::set_file_mtime(&path, FileTime::from_unix_time(mtime, 0)).unwrap();
@@ -297,6 +140,6 @@ async fn manage_mtime(
     } else {
         drop(permit);
         metrics.files_mtime_updated.fetch_add(1, Ordering::Relaxed);
-        tx.send((string_path, sha256, mtime_on_disk)).unwrap()
+        cache.insert(string_path, sha256, mtime_on_disk).await;
     }
 }
