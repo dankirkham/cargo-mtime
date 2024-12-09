@@ -1,27 +1,29 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-use color_eyre::eyre::{
-    Context,
-    Report,
-    Result,
-};
+use async_trait::async_trait;
+use color_eyre::eyre::{Context, Report, Result};
 use speedy::Readable;
 use speedy::Writable;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
-use tokio::sync::mpsc::{
-    UnboundedReceiver,
-    UnboundedSender,
-    unbounded_channel,
-};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use crate::Config;
-use crate::cache::{Cache, DatabaseQuery};
+use crate::cache::Cache;
 use crate::metrics::Metrics;
+use crate::config::DiskConfig;
+
+#[derive(Debug)]
+pub struct DatabaseQuery {
+    /// Path to the file
+    pub path: String,
+    /// SHA256 hash of the file
+    pub sha256: String,
+    pub response: oneshot::Sender<Option<i64>>,
+}
 
 type Database = BTreeMap<String, BTreeMap<String, i64>>;
 
@@ -38,7 +40,12 @@ async fn database_lookup_task(
     metrics: Arc<Metrics>,
     read_connection: DB,
 ) -> Result<()> {
-    while let Some(DatabaseQuery { path, sha256, response }) = query_rx.recv().await {
+    while let Some(DatabaseQuery {
+        path,
+        sha256,
+        response,
+    }) = query_rx.recv().await
+    {
         let path: String = path;
         let sha256: String = sha256;
         let mtime = try_get_mtime(&read_connection, &path, &sha256, metrics.as_ref()).await;
@@ -107,7 +114,10 @@ async fn gather_submit_db(
     debug!("gather_submit_db finalizing...");
 
     if !current_batch.is_empty() {
-        debug!("gather_submit_db has {} entries left to write.", current_batch.len());
+        debug!(
+            "gather_submit_db has {} entries left to write.",
+            current_batch.len()
+        );
         update_database(&connection, &mut current_batch, metrics.as_ref()).await
     }
     debug!("gather_submit_db finalized");
@@ -124,7 +134,7 @@ pub struct DiskCache {
 }
 
 impl DiskCache {
-    pub fn init(config: &Config, metrics: Arc<Metrics>) -> Result<Self> {
+    pub fn init(config: &DiskConfig, metrics: Arc<Metrics>) -> Result<Self> {
         // Create the database if it doesn't exist
         let db_path = config.db_path.clone();
         let file = std::fs::read(&db_path).unwrap_or_default();
@@ -153,11 +163,7 @@ impl DiskCache {
         let write_handle = tokio::spawn(gather_submit_db(write_rx, db.clone(), metrics.clone()));
 
         let (read_tx, read_rx) = unbounded_channel::<DatabaseQuery>();
-        let read_handle = tokio::spawn(database_lookup_task(
-            read_rx,
-            metrics.clone(),
-            db.clone(),
-        ));
+        let read_handle = tokio::spawn(database_lookup_task(read_rx, metrics.clone(), db.clone()));
 
         Ok(Self {
             db_path,
@@ -168,8 +174,11 @@ impl DiskCache {
             read_handle,
         })
     }
+}
 
-    pub async fn finalize(self) {
+#[async_trait]
+impl Cache for DiskCache {
+    async fn finalize(self: Box<Self>) {
         // TODO: Use std::future::async_drop when it is stable.
         let Self {
             db_path,
@@ -178,7 +187,7 @@ impl DiskCache {
             write_handle,
             read_tx,
             read_handle,
-        } = self;
+        } = *self;
 
         drop(read_tx);
         drop(write_tx);
@@ -197,9 +206,7 @@ impl DiskCache {
         }
         std::fs::write(&db_path, buffer).unwrap();
     }
-}
 
-impl Cache for DiskCache {
     async fn get(&self, path: String, sha256: String) -> Option<i64> {
         let (response_tx, response_rx) = oneshot::channel();
         let query = DatabaseQuery {

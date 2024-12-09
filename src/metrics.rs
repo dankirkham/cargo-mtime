@@ -14,4 +14,3 @@ pub struct Metrics {
 
     pub database_mtime_write: AtomicUsize,
 }
-

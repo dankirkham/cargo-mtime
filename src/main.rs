@@ -18,7 +18,6 @@ use std::sync::Arc;
 use async_walkdir::DirEntry;
 use async_walkdir::Filtering;
 use async_walkdir::WalkDir;
-use envconfig::Envconfig;
 use filetime::FileTime;
 use futures::StreamExt;
 use tokio::sync::Semaphore;
@@ -27,8 +26,8 @@ use tracing::info;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 
-use crate::cache::{Cache, DiskCache};
-use crate::config::Config;
+use crate::cache::{Cache, DiskCache, RedisCache};
+use crate::config::{CacheConfig, Config};
 use crate::metrics::Metrics;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -46,11 +45,16 @@ async fn main() {
 
     let metrics = Arc::new(Metrics::default());
 
-    let config = Config::init_from_env().unwrap();
-    let cache = Arc::new(DiskCache::init(&config, metrics.clone()).unwrap());
+    let config = Config::from_env();
+    info!("{:?}", &config);
+    let cache: Box<dyn Cache> = match config.cache_config {
+        CacheConfig::Disk(config) => Box::new(DiskCache::init(&config, metrics.clone()).unwrap()),
+        CacheConfig::Redis(config) => Box::new(RedisCache::init(&config, metrics.clone()).unwrap()),
+    };
+    let cache = Arc::new(cache);
 
     // We'll use a semaphore to limit the number of concurrent file operations, to avoid running out of file descriptors.
-    let semaphore = Arc::new(Semaphore::new(768));
+    let semaphore = Arc::new(Semaphore::new(100));
     let mut entries = WalkDir::new(&config.root_dir).filter(|entry| async move {
         if let Some(true) = entry
             .path()
@@ -98,9 +102,9 @@ async fn main() {
         }
     }
 
-    while join_set.join_next().await.is_some() { }
+    while join_set.join_next().await.is_some() {}
 
-    let cache = Arc::<DiskCache>::try_unwrap(cache).unwrap();
+    let cache = Arc::<Box<dyn Cache>>::into_inner(cache).unwrap();
     cache.finalize().await;
 
     info!("{:?}", metrics);
@@ -115,7 +119,7 @@ async fn manage_mtime(
     entry: DirEntry,
     permit: Arc<Semaphore>,
     metrics: Arc<Metrics>,
-    cache: Arc<impl Cache>,
+    cache: Arc<Box<dyn Cache>>,
 ) {
     let permit = permit.acquire().await.unwrap();
     let path = entry.path();
