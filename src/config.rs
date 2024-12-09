@@ -1,9 +1,12 @@
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Directory to process mtimes of.
+    /// Directory to process mtimes of. Set with `CARGO_MTIME_ROOT` environment variable.
     pub root_dir: String,
 
-    /// Cache config
+    /// Max open files. Set with `CARGO_MTIME_MAX_OPEN_FILES` environment variable. Default is `768`.
+    pub max_open_files: usize,
+
+    /// Cache config. Set with `CARGO_MTIME_CACHE_TYPE`. Default is `disk`.
     pub cache_config: CacheConfig,
 }
 
@@ -21,13 +24,13 @@ pub enum CacheConfig {
 
 #[derive(Debug, Clone)]
 pub struct DiskConfig {
-    /// Path to database
+    /// Path to database. Set with `CARGO_MTIME_DB_PATH`.
     pub db_path: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct RedisConfig {
-    /// URL to Redis
+    /// URL to Redis. Set with `CARGO_MTIME_REDIS_URL`, defaults to localhost.
     pub url: String,
 }
 
@@ -71,9 +74,15 @@ impl Config {
             }
         };
 
+        let max_open_files = std::env::var("CARGO_MTIME_MAX_OPEN_FILES")
+            .unwrap_or("768".to_owned())
+            .parse()
+            .unwrap();
+
         Self {
             root_dir,
             cache_config,
+            max_open_files,
         }
     }
 }

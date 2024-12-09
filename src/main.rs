@@ -54,7 +54,7 @@ async fn main() {
     let cache = Arc::new(cache);
 
     // We'll use a semaphore to limit the number of concurrent file operations, to avoid running out of file descriptors.
-    let semaphore = Arc::new(Semaphore::new(100));
+    let semaphore = Arc::new(Semaphore::new(config.max_open_files));
     let mut entries = WalkDir::new(&config.root_dir).filter(|entry| async move {
         if let Some(true) = entry
             .path()
@@ -115,6 +115,7 @@ async fn main() {
 /// * If we have no record, we store current file mtime, sha256, and path to the database
 /// * If the sha256 is different, we *record* the mtime and sha256 of the file but do not touch it
 /// * If the sha256 is the same, we set the mtime of the file to the recorded previous time
+#[tracing::instrument(skip_all)]
 async fn manage_mtime(
     entry: DirEntry,
     permit: Arc<Semaphore>,
