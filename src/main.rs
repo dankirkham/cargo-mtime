@@ -22,7 +22,7 @@ use filetime::FileTime;
 use futures::StreamExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -108,6 +108,16 @@ async fn main() {
     cache.finalize().await;
 
     info!("{:?}", metrics);
+
+    let files_processed = metrics.files_processed.load(Ordering::Relaxed);
+    let queries_made = metrics.database_mtime_queries.load(Ordering::Relaxed);
+
+    if files_processed != queries_made {
+        warn!(
+            "{} files failed to open due to OS open file limits.",
+            files_processed - queries_made
+        );
+    }
 }
 
 /// Attempts to set the mtime of the file on disk such that:
@@ -115,7 +125,6 @@ async fn main() {
 /// * If we have no record, we store current file mtime, sha256, and path to the database
 /// * If the sha256 is different, we *record* the mtime and sha256 of the file but do not touch it
 /// * If the sha256 is the same, we set the mtime of the file to the recorded previous time
-#[tracing::instrument(skip_all)]
 async fn manage_mtime(
     entry: DirEntry,
     permit: Arc<Semaphore>,

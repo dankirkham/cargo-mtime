@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::cache::Cache;
-use crate::metrics::Metrics;
 use crate::config::DiskConfig;
+use crate::metrics::Metrics;
 
 #[derive(Debug)]
 pub struct DatabaseQuery {

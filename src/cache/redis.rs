@@ -15,8 +15,8 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::cache::Cache;
-use crate::metrics::Metrics;
 use crate::config::RedisConfig;
+use crate::metrics::Metrics;
 
 struct ReadRequest {
     path: String,
@@ -37,6 +37,10 @@ async fn read_task(
         response,
     }) = read_rx.recv().await
     {
+        metrics
+            .database_mtime_queries
+            .fetch_add(1, Ordering::Relaxed);
+
         // Concatenate path and sha256
         path.push_str(&sha256);
 
@@ -66,7 +70,7 @@ struct WriteRequest {
 
 async fn write_operation(
     conn: &mut MultiplexedConnection,
-    batch: &mut Vec<WriteRequest>,
+    batch: &mut [WriteRequest],
     metrics: &Metrics,
 ) {
     let ops: Vec<_> = batch
@@ -78,7 +82,7 @@ async fn write_operation(
                 mtime,
             } = req;
             let mut key = path.clone();
-            key.push_str(&sha256);
+            key.push_str(sha256);
             (key, *mtime)
         })
         .collect();
